@@ -30,6 +30,11 @@ export async function POST(req: Request) {
     return NextResponse.json({ itinerary });
   } catch (error) {
     const err = extractApiError(error);
+    console.error('[TripGenie][POST /api/trips/generate] Failed:', {
+      status: err.status,
+      message: err.message,
+      raw: error instanceof Error ? error.message : String(error),
+    });
     return NextResponse.json({ error: err.message }, { status: err.status });
   }
 }

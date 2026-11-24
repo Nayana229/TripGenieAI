@@ -1,30 +1,75 @@
-import { GoogleGenAI, ThinkingLevel, Type, type GenerateContentResponse, type Schema } from '@google/genai';
+import { createHash } from 'node:crypto';
+import {
+  GoogleGenAI,
+  ThinkingLevel,
+  Type,
+  type GenerateContentResponse,
+  type Schema,
+} from '@google/genai';
 import type { ItineraryData, TripInput } from '../types/travel';
 import { modularTravelAdapters } from './travelProviders';
 
 export const PRIMARY_GEMINI_MODEL = 'gemini-4-hydrogen';
 export const FALLBACK_GEMINI_MODELS = ['gemini-3.1-flash-lite'] as const;
 
+// Non-deprecated fast/lite generateContent candidates ordered by preference
+// when verifying or extending against ai.models.list().
+const PREFERRED_VERIFIED_MODELS = [
+  'gemini-4-hydrogen',
+  'gemini-3.1-flash-lite',
+  'gemini-3-flash-preview',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+] as const;
+
 const DEPRECATED_MODELS = new Set([
   'gemini-1.5-flash',
+  'gemini-1.5-flash-8b',
   'gemini-1.5-pro',
   'gemini-pro',
+  'gemini-pro-vision',
+  'gemini-1.0-pro',
   'gemini-2.0-flash',
+  'gemini-2.0-flash-lite',
   'gemini-2.0-pro',
   'gemini-2.0-flash-thinking',
+  'gemini-2.0-flash-exp',
 ]);
 
-export function resolveModelChain(dayCount = 3): string[] {
-  const envModel = process.env.GEMINI_MODEL?.trim();
-  if (envModel && !DEPRECATED_MODELS.has(envModel)) {
-    return Array.from(new Set([envModel, ...FALLBACK_GEMINI_MODELS, PRIMARY_GEMINI_MODEL]));
-  }
-  // Longer itineraries (6-14 days) produce large structured JSON; lead with fast lite model
-  // to stay well under 10s serverless gateway timeouts, keeping hydrogen as fallback.
-  if (dayCount >= 6) {
-    return ['gemini-3.1-flash-lite', PRIMARY_GEMINI_MODEL];
-  }
-  return [PRIMARY_GEMINI_MODEL, ...FALLBACK_GEMINI_MODELS];
+// Paid-tier-only models that must not be auto-selected on free keys unless explicitly configured.
+const PAID_ONLY_MODELS = new Set([
+  'gemini-4-carbon',
+  'gemini-4-neon',
+  'gemini-4-argon',
+  'gemini-3-pro-image',
+  'gemini-nano-banana-2.1',
+  'gemini-3.1-flash-lite-image',
+  'gemini-omni-1.2-flash',
+  'genie-4',
+  'lyria-3-clip-preview',
+  'lyria-3-pro-preview',
+]);
+
+const NON_TEXT_MODEL_RE =
+  /(embed|imagen|veo|lyria|tts|transcribe|live|audio|image|genie|decision|robotics|computer-use|aqa|gemma|bisect|learnlm)/i;
+
+const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_MODELS_PER_REQUEST = 3;
+
+interface CachedModelsEntry {
+  keyFingerprint: string;
+  fetchedAt: number;
+  generateContentModels: string[];
+}
+
+let cachedModels: CachedModelsEntry | null = null;
+
+export interface ModelAttemptRecord {
+  model: string;
+  status?: number;
+  code?: string;
+  message: string;
+  durationMs: number;
 }
 
 export class GeminiConfigError extends Error {
@@ -34,9 +79,36 @@ export class GeminiConfigError extends Error {
   }
 }
 
-export function getGeminiApiKey(): string | null {
-  const candidates = [process.env.GEMINI_API_KEY, process.env.GOOGLE_API_KEY];
-  for (const raw of candidates) {
+export class GeminiAggregateError extends Error {
+  readonly attempts: ModelAttemptRecord[];
+  readonly availableModels?: string[];
+  readonly lastError: unknown;
+
+  constructor(
+    message: string,
+    attempts: ModelAttemptRecord[],
+    lastError: unknown,
+    availableModels?: string[]
+  ) {
+    super(message);
+    this.name = 'GeminiAggregateError';
+    this.attempts = attempts;
+    this.lastError = lastError;
+    this.availableModels = availableModels;
+  }
+}
+
+export function getGeminiApiKeyDetails(): {
+  apiKey: string | null;
+  envVarName: string | null;
+} {
+  const candidates: Array<[string, string | undefined]> = [
+    ['GEMINI_API_KEY', process.env.GEMINI_API_KEY],
+    ['GOOGLE_API_KEY', process.env.GOOGLE_API_KEY],
+    ['GOOGLE_GENERATIVE_AI_API_KEY', process.env.GOOGLE_GENERATIVE_AI_API_KEY],
+  ];
+
+  for (const [envVarName, raw] of candidates) {
     if (!raw) continue;
     const cleaned = raw.trim().replace(/^["']|["']$/g, '').trim();
     if (
@@ -44,18 +116,26 @@ export function getGeminiApiKey(): string | null {
       cleaned !== 'MY_GEMINI_API_KEY' &&
       cleaned !== 'YOUR_GEMINI_API_KEY'
     ) {
-      return cleaned;
+      return { apiKey: cleaned, envVarName };
     }
   }
-  return null;
+  return { apiKey: null, envVarName: null };
 }
 
-function createGeminiClient(): GoogleGenAI {
-  const apiKey = getGeminiApiKey();
+export function getGeminiApiKey(): string | null {
+  return getGeminiApiKeyDetails().apiKey;
+}
+
+function getKeyFingerprint(apiKey: string): string {
+  return createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
+}
+
+function createGeminiClient(): { ai: GoogleGenAI; apiKey: string } {
+  const { apiKey } = getGeminiApiKeyDetails();
   if (!apiKey) {
     throw new GeminiConfigError('GEMINI_API_KEY is not configured on the server.');
   }
-  return new GoogleGenAI({
+  const ai = new GoogleGenAI({
     apiKey,
     httpOptions: {
       headers: {
@@ -63,6 +143,195 @@ function createGeminiClient(): GoogleGenAI {
       },
     },
   });
+  return { ai, apiKey };
+}
+
+function normalizeModelId(rawName: string | undefined): string {
+  if (!rawName) return '';
+  return rawName.trim().replace(/^models\//, '');
+}
+
+export function isDeprecatedModelId(modelId: string): boolean {
+  const normalized = normalizeModelId(modelId).toLowerCase();
+  if (!normalized) return true;
+  if (DEPRECATED_MODELS.has(normalized)) return true;
+  if (
+    normalized.startsWith('gemini-1.') ||
+    normalized.startsWith('gemini-2.0-') ||
+    normalized === 'gemini-pro'
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function isCandidateTextModel(modelId: string, allowExplicitEnvModel?: string): boolean {
+  const normalized = normalizeModelId(modelId);
+  if (!normalized) return false;
+  if (isDeprecatedModelId(normalized)) return false;
+  if (NON_TEXT_MODEL_RE.test(normalized)) return false;
+  if (PAID_ONLY_MODELS.has(normalized) && normalized !== allowExplicitEnvModel) {
+    return false;
+  }
+  return normalized.startsWith('gemini-');
+}
+
+export function resolveModelChain(
+  dayCount = 3,
+  availableGenerateContentModels?: string[]
+): string[] {
+  const rawEnvModel = normalizeModelId(process.env.GEMINI_MODEL);
+  const envModel = rawEnvModel && !isDeprecatedModelId(rawEnvModel) ? rawEnvModel : '';
+
+  const baseDefaults =
+    dayCount >= 6
+      ? ['gemini-3.1-flash-lite', PRIMARY_GEMINI_MODEL]
+      : [PRIMARY_GEMINI_MODEL, ...FALLBACK_GEMINI_MODELS];
+
+  if (!availableGenerateContentModels || availableGenerateContentModels.length === 0) {
+    return Array.from(new Set([...(envModel ? [envModel] : []), ...baseDefaults]))
+      .filter((id) => isCandidateTextModel(id, envModel))
+      .slice(0, MAX_MODELS_PER_REQUEST);
+  }
+
+  const desiredOrder = Array.from(
+    new Set([
+      ...(envModel ? [envModel] : []),
+      ...baseDefaults,
+      ...PREFERRED_VERIFIED_MODELS,
+    ])
+  ).filter((id) => isCandidateTextModel(id, envModel));
+
+  const availableSet = new Set(availableGenerateContentModels.map((m) => normalizeModelId(m)));
+  const verifiedPreferred = desiredOrder.filter((id) => availableSet.has(id));
+
+  // Add any remaining verified non-deprecated Gemini flash/lite text models from models.list()
+  const extraVerified = availableGenerateContentModels
+    .map((m) => normalizeModelId(m))
+    .filter(
+      (id) =>
+        !verifiedPreferred.includes(id) &&
+        isCandidateTextModel(id, envModel) &&
+        (id.includes('flash') || id.includes('hydrogen') || id.includes('lite'))
+    );
+
+  const combined = [...verifiedPreferred, ...extraVerified];
+
+  if (combined.length > 0) {
+    return combined.slice(0, MAX_MODELS_PER_REQUEST);
+  }
+
+  // Last-resort verified text models if none matched flash/hydrogen naming
+  const anyVerifiedGemini = availableGenerateContentModels
+    .map((m) => normalizeModelId(m))
+    .filter((id) => isCandidateTextModel(id, envModel));
+
+  if (anyVerifiedGemini.length > 0) {
+    return anyVerifiedGemini.slice(0, MAX_MODELS_PER_REQUEST);
+  }
+
+  return baseDefaults.slice(0, MAX_MODELS_PER_REQUEST);
+}
+
+export async function listVerifiedGenerateContentModels(
+  ai: GoogleGenAI,
+  apiKey: string,
+  options?: { bypassCache?: boolean; timeoutMs?: number }
+): Promise<string[]> {
+  const fingerprint = getKeyFingerprint(apiKey);
+  if (
+    !options?.bypassCache &&
+    cachedModels &&
+    cachedModels.keyFingerprint === fingerprint &&
+    Date.now() - cachedModels.fetchedAt < MODEL_CACHE_TTL_MS
+  ) {
+    return cachedModels.generateContentModels;
+  }
+
+  const timeoutMs = options?.timeoutMs ?? 2_800;
+  const fetchList = async (): Promise<string[]> => {
+    const pager = await ai.models.list({ config: { pageSize: 100 } });
+    const supported: string[] = [];
+    for await (const model of pager) {
+      const id = normalizeModelId(model.name);
+      if (!id) continue;
+      const actions = model.supportedActions;
+      const supportsGenerate =
+        Array.isArray(actions) &&
+        actions.some((a) => a === 'generateContent' || a === 'generateText');
+      if (supportsGenerate && !isDeprecatedModelId(id)) {
+        supported.push(id);
+      }
+    }
+    return Array.from(new Set(supported));
+  };
+
+  const models = await withTimeout(fetchList(), timeoutMs, 'Gemini models.list');
+  cachedModels = {
+    keyFingerprint: fingerprint,
+    fetchedAt: Date.now(),
+    generateContentModels: models,
+  };
+  return models;
+}
+
+export async function verifyGeminiSetup(): Promise<{
+  geminiConfigured: boolean;
+  keyEnvVar: string | null;
+  keyStatus: 'valid' | 'missing' | 'invalid' | 'permission_denied' | 'quota_exceeded' | 'error';
+  availableGenerateContentModels: string[];
+  selectedModelChain: string[];
+  errorMessage?: string;
+}> {
+  const { apiKey, envVarName } = getGeminiApiKeyDetails();
+  if (!apiKey) {
+    return {
+      geminiConfigured: false,
+      keyEnvVar: null,
+      keyStatus: 'missing',
+      availableGenerateContentModels: [],
+      selectedModelChain: resolveModelChain(3),
+      errorMessage:
+        'GEMINI_API_KEY is not set in the server environment. Add it in Vercel Project Settings -> Environment Variables or AI Studio Settings > Secrets.',
+    };
+  }
+
+  const ai = new GoogleGenAI({
+    apiKey,
+    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+  });
+
+  try {
+    const available = await listVerifiedGenerateContentModels(ai, apiKey, {
+      bypassCache: true,
+      timeoutMs: 5_000,
+    });
+    const selectedModelChain = resolveModelChain(3, available);
+    return {
+      geminiConfigured: true,
+      keyEnvVar: envVarName,
+      keyStatus: 'valid',
+      availableGenerateContentModels: available,
+      selectedModelChain,
+    };
+  } catch (err) {
+    const parsed = inspectUpstreamError(err);
+    let keyStatus: 'invalid' | 'permission_denied' | 'quota_exceeded' | 'error' = 'error';
+    if (isAuthOrKeyError(err)) {
+      keyStatus = parsed.status === 403 ? 'permission_denied' : 'invalid';
+    } else if (parsed.status === 429) {
+      keyStatus = 'quota_exceeded';
+    }
+    console.error('[TripGenie][Gemini] verifyGeminiSetup models.list failed:', parsed);
+    return {
+      geminiConfigured: true,
+      keyEnvVar: envVarName,
+      keyStatus,
+      availableGenerateContentModels: [],
+      selectedModelChain: resolveModelChain(3),
+      errorMessage: parsed.message,
+    };
+  }
 }
 
 function parseJsonSafe<T>(rawText: string, label: string): T {
@@ -237,12 +506,57 @@ const chatResponseSchema: Schema = {
   required: ['reply', 'shouldUpdateItinerary'],
 };
 
-function getErrorStatusCode(error: unknown): number | undefined {
-  if (typeof error === 'object' && error !== null && 'status' in error) {
-    const code = Number((error as { status?: unknown }).status);
-    if (!Number.isNaN(code)) return code;
+function inspectUpstreamError(error: unknown): {
+  status?: number;
+  code?: string;
+  message: string;
+} {
+  const raw = error instanceof Error ? error.message : String(error || 'Unknown Gemini error');
+  let status =
+    typeof error === 'object' && error !== null && 'status' in error
+      ? Number((error as { status?: unknown }).status)
+      : undefined;
+  if (status !== undefined && Number.isNaN(status)) status = undefined;
+
+  let code: string | undefined;
+  let message = raw;
+
+  const trimmed = raw.trim();
+  const jsonStart = trimmed.indexOf('{');
+  if (jsonStart !== -1) {
+    try {
+      const parsed = JSON.parse(trimmed.slice(jsonStart)) as {
+        error?: { code?: number; message?: string; status?: string };
+        message?: string;
+        status?: string;
+      };
+      if (parsed.error) {
+        if (!status && parsed.error.code) status = Number(parsed.error.code);
+        code = parsed.error.status;
+        if (parsed.error.message) message = parsed.error.message;
+      } else if (parsed.message) {
+        message = parsed.message;
+      }
+    } catch {
+      // Keep original message if not JSON
+    }
   }
-  return undefined;
+
+  return { status, code, message };
+}
+
+function isAuthOrKeyError(error: unknown): boolean {
+  const info = inspectUpstreamError(error);
+  const lower = `${info.code ?? ''} ${info.message}`.toLowerCase();
+  return (
+    info.status === 401 ||
+    info.status === 403 ||
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
+    lower.includes('api key expired') ||
+    lower.includes('permission_denied') ||
+    lower.includes('unauthenticated')
+  );
 }
 
 function isTimeoutError(error: unknown): boolean {
@@ -256,32 +570,38 @@ function isTimeoutError(error: unknown): boolean {
 }
 
 function isTransientError(error: unknown): boolean {
-  const status = getErrorStatusCode(error);
-  if (status === 429 || status === 502 || status === 503 || status === 504) {
+  const info = inspectUpstreamError(error);
+  if (info.status === 429 || info.status === 502 || info.status === 503 || info.status === 504) {
     return true;
   }
   if (isTimeoutError(error)) return true;
-  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  const lower = `${info.code ?? ''} ${info.message}`.toLowerCase();
   return (
-    msg.includes('429') ||
-    msg.includes('503') ||
-    msg.includes('504') ||
-    msg.includes('unavailable') ||
-    msg.includes('high demand') ||
-    msg.includes('overloaded') ||
-    msg.includes('resource_exhausted') ||
-    msg.includes('econnreset') ||
-    msg.includes('etimedout') ||
-    msg.includes('fetch failed')
+    lower.includes('429') ||
+    lower.includes('503') ||
+    lower.includes('504') ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand') ||
+    lower.includes('overloaded') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('econnreset') ||
+    lower.includes('etimedout') ||
+    lower.includes('fetch failed')
   );
 }
 
 function isModelFallbackEligible(error: unknown): boolean {
+  if (isAuthOrKeyError(error)) return false;
   if (isTransientError(error)) return true;
-  const status = getErrorStatusCode(error);
-  if (status === 404) return true;
-  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
-  return msg.includes('not_found') || msg.includes('not found');
+  const info = inspectUpstreamError(error);
+  if (info.status === 404 || info.status === 400) return true;
+  const lower = `${info.code ?? ''} ${info.message}`.toLowerCase();
+  return (
+    lower.includes('not_found') ||
+    lower.includes('not found') ||
+    lower.includes('not supported') ||
+    lower.includes('invalid_argument')
+  );
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -299,72 +619,130 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
   }
 }
 
-async function withFastRetry<T>(
-  fn: () => Promise<T>,
-  label: string,
-  perAttemptMs: number,
-  deadlineAt: number,
-  maxRetries = 0
-): Promise<T> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const attemptStart = Date.now();
-    const remaining = deadlineAt - attemptStart;
-    if (remaining <= 1000) {
-      throw lastError ?? new Error(`${label} timed out before completing.`);
-    }
-    const callTimeout = Math.min(perAttemptMs, remaining - 300);
-    try {
-      return await withTimeout(fn(), callTimeout, label);
-    } catch (error) {
-      lastError = error;
-      const elapsed = Date.now() - attemptStart;
-      if (isTimeoutError(error) || elapsed > 1200 || !isTransientError(error) || attempt === maxRetries) {
-        throw error;
-      }
-      const delayMs = Math.min(250, Math.max(0, deadlineAt - Date.now() - 2500));
-      if (delayMs <= 0) throw error;
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
+function buildThinkingConfig(model: string): { thinkingConfig?: { thinkingLevel: ThinkingLevel } } {
+  // Only Gemini 4 primary model gets explicit LOW thinking; gemini-3.1-flash-lite defaults to MINIMAL,
+  // and non-Gemini-3/4 models reject thinkingLevel with 400.
+  if (model === 'gemini-4-hydrogen') {
+    return { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } };
   }
-  throw lastError;
+  return {};
 }
 
 async function generateWithModelFallback(
-  executeForModel: (model: string) => Promise<GenerateContentResponse>,
+  executeForModel: (ai: GoogleGenAI, model: string) => Promise<GenerateContentResponse>,
   dayCount = 3
 ): Promise<GenerateContentResponse> {
-  const models = resolveModelChain(dayCount);
+  const { ai, apiKey } = createGeminiClient();
+
+  let availableModels: string[] | undefined;
+  try {
+    availableModels = await listVerifiedGenerateContentModels(ai, apiKey);
+    if (availableModels.length > 0) {
+      console.info(
+        `[TripGenie][Gemini] Verified generateContent models (${availableModels.length}): ${availableModels.join(', ')}`
+      );
+    }
+  } catch (listErr) {
+    // Fail fast if the API key itself is invalid or lacks permission.
+    if (isAuthOrKeyError(listErr)) {
+      const info = inspectUpstreamError(listErr);
+      console.error('[TripGenie][Gemini] models.list auth failure:', info);
+      throw listErr;
+    }
+    const info = inspectUpstreamError(listErr);
+    console.warn(
+      `[TripGenie][Gemini] models.list skipped (${info.message}); falling back to default model chain.`
+    );
+  }
+
+  const models = resolveModelChain(dayCount, availableModels);
   const deadlineAt = Date.now() + 18_000;
+  const attempts: ModelAttemptRecord[] = [];
   let lastError: unknown;
 
   for (let i = 0; i < models.length; i++) {
     const model = models[i];
     const hasNext = i < models.length - 1;
-    // Fail over fast (4.5s) from primary so fallback completes inside strict 10s serverless limits.
-    const perAttemptMs = hasNext ? 4_500 : Math.max(3_500, deadlineAt - Date.now() - 300);
-    const retries = hasNext ? 0 : 1;
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 1_200) {
+      break;
+    }
 
+    // Fail over cleanly (up to 5.5s on primary when fallback exists) so we don't stall on overloaded models.
+    const callTimeoutMs = hasNext
+      ? Math.min(5_500, remaining - 3_000)
+      : Math.max(3_500, remaining - 250);
+
+    const start = Date.now();
     try {
-      return await withFastRetry(
-        () => executeForModel(model),
-        `Gemini (${model})`,
-        perAttemptMs,
-        deadlineAt,
-        retries
+      const response = await withTimeout(
+        executeForModel(ai, model),
+        callTimeoutMs,
+        `Gemini (${model})`
       );
+      return response;
     } catch (error) {
+      const durationMs = Date.now() - start;
+      const info = inspectUpstreamError(error);
+      attempts.push({
+        model,
+        status: info.status,
+        code: info.code,
+        message: info.message,
+        durationMs,
+      });
       lastError = error;
-      if (!hasNext || !isModelFallbackEligible(error)) {
+
+      console.error(
+        `[TripGenie][Gemini] Model "${model}" failed in ${durationMs}ms (status=${info.status ?? 'unknown'}, code=${info.code ?? 'none'}): ${info.message}`
+      );
+
+      // Auth/key errors cannot be solved by trying another model — fail immediately.
+      if (isAuthOrKeyError(error)) {
         throw error;
       }
-      console.warn(
-        `Gemini model "${model}" unavailable/slow; falling back to "${models[i + 1]}".`
-      );
+
+      // Single fast retry ONLY when there is just 1 model in the chain and it failed quickly with a transient error.
+      if (!hasNext && models.length === 1 && durationMs < 1_200 && isTransientError(error)) {
+        const retryRemaining = deadlineAt - Date.now();
+        if (retryRemaining > 3_000) {
+          await new Promise((r) => setTimeout(r, 350));
+          const retryStart = Date.now();
+          try {
+            return await withTimeout(
+              executeForModel(ai, model),
+              Math.max(2_500, deadlineAt - Date.now() - 250),
+              `Gemini (${model} retry)`
+            );
+          } catch (retryErr) {
+            const retryInfo = inspectUpstreamError(retryErr);
+            attempts.push({
+              model: `${model} (retry)`,
+              status: retryInfo.status,
+              code: retryInfo.code,
+              message: retryInfo.message,
+              durationMs: Date.now() - retryStart,
+            });
+            lastError = retryErr;
+          }
+        }
+      }
+
+      if (!hasNext || !isModelFallbackEligible(error)) {
+        break;
+      }
     }
   }
 
-  throw lastError;
+  const summary = attempts
+    .map((a) => `${a.model}: ${a.status ?? 'ERR'} ${a.message}`)
+    .join(' | ');
+  throw new GeminiAggregateError(
+    summary || 'All verified Gemini models failed.',
+    attempts,
+    lastError,
+    availableModels
+  );
 }
 
 export function computeTripDays(startDate: string, endDate: string): string[] {
@@ -381,7 +759,6 @@ export function computeTripDays(startDate: string, endDate: string): string[] {
 }
 
 export async function generateStructuredItinerary(input: TripInput): Promise<ItineraryData> {
-  const ai = createGeminiClient();
   const dates = computeTripDays(input.startDate, input.endDate);
 
   const [flightAdvisory, lodgingAdvisory, weatherAdvisory] = await Promise.all([
@@ -421,7 +798,7 @@ Context notes to incorporate into disclaimers:
 - ${weatherAdvisory.advisory}`;
 
   const response = await generateWithModelFallback(
-    (model) =>
+    (ai, model) =>
       ai.models.generateContent({
         model,
         contents: prompt,
@@ -429,9 +806,7 @@ Context notes to incorporate into disclaimers:
           systemInstruction,
           responseMimeType: 'application/json',
           responseSchema: itinerarySchema,
-          ...(model === PRIMARY_GEMINI_MODEL
-            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-            : {}),
+          ...buildThinkingConfig(model),
         },
       }),
     dates.length
@@ -443,7 +818,6 @@ Context notes to incorporate into disclaimers:
   }
 
   const parsed = parseJsonSafe<ItineraryData>(rawText, 'itinerary');
-  // Ensure currency and userBudget match input deterministically
   parsed.budgetAnalysis.userBudget = input.totalBudget;
   parsed.budgetAnalysis.currency = input.currency;
   return parsed;
@@ -459,8 +833,6 @@ export async function refineItineraryWithChat(params: {
   shouldUpdateItinerary: boolean;
   updatedItinerary?: ItineraryData;
 }> {
-  const ai = createGeminiClient();
-
   const systemInstruction = `You are TripGenie AI's conversational itinerary assistant.
 You help travellers ask questions about their trip AND modify their structured itinerary on request (e.g., swapping activities, adjusting budget/pace, adding dietary-friendly restaurants, reordering days).
 
@@ -487,7 +859,7 @@ Latest Traveller Message:
 ${params.userMessage}`;
 
   const response = await generateWithModelFallback(
-    (model) =>
+    (ai, model) =>
       ai.models.generateContent({
         model,
         contents: prompt,
@@ -495,9 +867,7 @@ ${params.userMessage}`;
           systemInstruction,
           responseMimeType: 'application/json',
           responseSchema: chatResponseSchema,
-          ...(model === PRIMARY_GEMINI_MODEL
-            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-            : {}),
+          ...buildThinkingConfig(model),
         },
       }),
     params.currentItinerary.days?.length ?? 3

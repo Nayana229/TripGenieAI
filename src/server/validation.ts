@@ -4,7 +4,11 @@ import {
   SUPPORTED_CURRENCIES,
   TRAVEL_PERSONALITIES,
 } from '../types/travel';
-import { GeminiConfigError } from './geminiService';
+import {
+  GeminiAggregateError,
+  GeminiConfigError,
+  type ModelAttemptRecord,
+} from './geminiService';
 
 export const tripInputSchema = z
   .object({
@@ -84,12 +88,14 @@ function extractReadableMessage(error: unknown): {
     typeof error === 'object' && error !== null && 'status' in error
       ? Number((error as { status?: unknown }).status)
       : undefined;
+  if (statusCode !== undefined && Number.isNaN(statusCode)) statusCode = undefined;
 
   let friendlyMessage = rawMessage;
   const trimmed = rawMessage.trim();
-  if (trimmed.startsWith('{')) {
+  const jsonStart = trimmed.indexOf('{');
+  if (jsonStart !== -1) {
     try {
-      const parsed = JSON.parse(trimmed) as {
+      const parsed = JSON.parse(trimmed.slice(jsonStart)) as {
         error?: { code?: number; message?: string; status?: string };
         message?: string;
       };
@@ -105,27 +111,31 @@ function extractReadableMessage(error: unknown): {
   return { rawMessage, friendlyMessage, statusCode };
 }
 
-export function extractApiError(error: unknown): { status: number; message: string } {
-  if (error instanceof GeminiConfigError) {
-    return {
-      status: 503,
-      message:
-        'Gemini API key is not configured on the server. Add GEMINI_API_KEY in your environment variables (Settings > Secrets or Vercel Environment Variables) and try again.',
-    };
-  }
+function summarizeAttemptModels(attempts?: ModelAttemptRecord[]): string {
+  if (!attempts || attempts.length === 0) return '';
+  const uniqueModels = Array.from(new Set(attempts.map((a) => a.model)));
+  return uniqueModels.join(', ');
+}
 
+function classifySingleError(
+  error: unknown,
+  attempts?: ModelAttemptRecord[]
+): { status: number; message: string } {
   const { rawMessage, friendlyMessage, statusCode } = extractReadableMessage(error);
   const lower = `${rawMessage} ${friendlyMessage}`.toLowerCase();
+  const triedModels = summarizeAttemptModels(attempts);
+  const triedSuffix = triedModels ? ` (attempted: ${triedModels})` : '';
 
   if (
     lower.includes('api_key_invalid') ||
     lower.includes('api key not valid') ||
+    lower.includes('api key expired') ||
     statusCode === 401
   ) {
     return {
       status: 401,
       message:
-        'The configured GEMINI_API_KEY is invalid. Please check or replace your key in Settings > Secrets or Vercel Environment Variables.',
+        'The configured GEMINI_API_KEY is invalid or expired. Update GEMINI_API_KEY in Vercel Environment Variables (or Settings > Secrets) and redeploy.',
     };
   }
 
@@ -133,7 +143,25 @@ export function extractApiError(error: unknown): { status: number; message: stri
     return {
       status: 403,
       message:
-        'Gemini API permission denied for the configured key. Please verify your GEMINI_API_KEY permissions.',
+        'Gemini API access was denied for the configured key (403). Verify Generative Language API access and billing permissions on your Google AI Studio project.',
+    };
+  }
+
+  if (lower.includes('resource_exhausted') || lower.includes('429') || statusCode === 429) {
+    return {
+      status: 429,
+      message: `Gemini API quota or rate limit exceeded (429)${triedSuffix}. Wait a moment or check your Google AI Studio quota and billing plan.`,
+    };
+  }
+
+  if (
+    lower.includes('not_found') ||
+    lower.includes('not supported for generatecontent') ||
+    statusCode === 404
+  ) {
+    return {
+      status: 502,
+      message: `The configured Gemini model was not found or does not support generateContent${triedSuffix}. Check GET /api/health?verify=1 to inspect available models for your API key.`,
     };
   }
 
@@ -146,24 +174,7 @@ export function extractApiError(error: unknown): { status: number; message: stri
   ) {
     return {
       status: 503,
-      message:
-        'Our AI travel planning models are temporarily experiencing high demand. We automatically retried with a fallback model, so please try again in a few moments.',
-    };
-  }
-
-  if (lower.includes('resource_exhausted') || lower.includes('429') || statusCode === 429) {
-    return {
-      status: 429,
-      message:
-        'Gemini API quota or rate limit reached. Please wait a moment and try again, or verify your billing quota.',
-    };
-  }
-
-  if (lower.includes('not_found') || statusCode === 404) {
-    return {
-      status: 502,
-      message:
-        'The requested Gemini model is unavailable for the configured API key. Please check your GEMINI_MODEL or API key access.',
+      message: `Upstream Gemini service returned 503 Unavailable${triedSuffix}: ${friendlyMessage}`,
     };
   }
 
@@ -175,8 +186,7 @@ export function extractApiError(error: unknown): { status: number; message: stri
   ) {
     return {
       status: 504,
-      message:
-        'The AI planner took too long to respond due to heavy upstream load. Please try again—shorter trips generate fastest.',
+      message: `Gemini did not finish responding in time${triedSuffix}. Please try again—shorter trips generate fastest.`,
     };
   }
 
@@ -189,14 +199,45 @@ export function extractApiError(error: unknown): { status: number; message: stri
   ) {
     return {
       status: 502,
-      message: 'Network error while reaching the Gemini API. Please check connectivity and retry.',
+      message: `Network error reaching the Gemini API${triedSuffix}: ${friendlyMessage}`,
     };
   }
 
   return {
-    status: 500,
+    status: statusCode && statusCode >= 400 && statusCode < 600 ? statusCode : 500,
     message: friendlyMessage.startsWith('{')
-      ? 'Unable to generate your itinerary right now. Please try again.'
-      : friendlyMessage,
+      ? `Unable to generate your itinerary right now${triedSuffix}.`
+      : `${friendlyMessage}${triedSuffix}`,
   };
+}
+
+export function extractApiError(error: unknown): { status: number; message: string } {
+  if (error instanceof GeminiConfigError) {
+    return {
+      status: 503,
+      message:
+        'Gemini API key is not configured on the server. Add GEMINI_API_KEY in Vercel Project Settings -> Environment Variables (or AI Studio Settings > Secrets) and redeploy.',
+    };
+  }
+
+  if (error instanceof GeminiAggregateError) {
+    console.error('[TripGenie][API] GeminiAggregateError:', {
+      attempts: error.attempts,
+      availableModelsCount: error.availableModels?.length ?? null,
+    });
+
+    const base = classifySingleError(error.lastError);
+    if (error.attempts.length > 0) {
+      const attemptSummary = error.attempts
+        .map((a) => `${a.model} [${a.status ?? 'ERR'}]`)
+        .join(', ');
+      return {
+        status: base.status,
+        message: `Tried Gemini models: ${attemptSummary}. ${base.message}`,
+      };
+    }
+    return base;
+  }
+
+  return classifySingleError(error);
 }
