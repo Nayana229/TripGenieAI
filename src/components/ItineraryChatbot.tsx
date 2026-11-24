@@ -53,6 +53,9 @@ export function ItineraryChatbot({
     setError(null);
     setSending(true);
 
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 25_000);
+
     try {
       const historyPayload = messages.map((m) => ({
         role: m.role,
@@ -62,6 +65,7 @@ export function ItineraryChatbot({
       const res = await fetch('/api/trips/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           tripInput,
           currentItinerary: itinerary,
@@ -81,6 +85,16 @@ export function ItineraryChatbot({
         try {
           data = JSON.parse(rawText) as typeof data;
         } catch {
+          if (res.status === 504) {
+            throw new Error(
+              'The assistant timed out while updating your itinerary (504). Please try a simpler request or retry.'
+            );
+          }
+          if (res.status === 502 || res.status === 503) {
+            throw new Error(
+              'The AI assistant is temporarily busy. Please try again in a few moments.'
+            );
+          }
           throw new Error(`Server returned an unexpected response (${res.status}).`);
         }
       }
@@ -95,8 +109,15 @@ export function ItineraryChatbot({
         data.shouldUpdateItinerary ? data.updatedItinerary : undefined
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Chat request failed.');
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setError(
+          'The assistant took too long to respond and timed out. Please try a shorter or simpler edit.'
+        );
+      } else {
+        setError(err instanceof Error ? err.message : 'Chat request failed.');
+      }
     } finally {
+      window.clearTimeout(timeoutId);
       setSending(false);
     }
   }

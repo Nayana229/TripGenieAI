@@ -14,11 +14,17 @@ const DEPRECATED_MODELS = new Set([
   'gemini-2.0-flash-thinking',
 ]);
 
-export function resolveModelChain(): string[] {
+export function resolveModelChain(dayCount = 3): string[] {
   const envModel = process.env.GEMINI_MODEL?.trim();
-  const primary =
-    envModel && !DEPRECATED_MODELS.has(envModel) ? envModel : PRIMARY_GEMINI_MODEL;
-  return Array.from(new Set([primary, ...FALLBACK_GEMINI_MODELS]));
+  if (envModel && !DEPRECATED_MODELS.has(envModel)) {
+    return Array.from(new Set([envModel, ...FALLBACK_GEMINI_MODELS, PRIMARY_GEMINI_MODEL]));
+  }
+  // Longer itineraries (6-14 days) produce large structured JSON; lead with fast lite model
+  // to stay well under 10s serverless gateway timeouts, keeping hydrogen as fallback.
+  if (dayCount >= 6) {
+    return ['gemini-3.1-flash-lite', PRIMARY_GEMINI_MODEL];
+  }
+  return [PRIMARY_GEMINI_MODEL, ...FALLBACK_GEMINI_MODELS];
 }
 
 export class GeminiConfigError extends Error {
@@ -239,11 +245,22 @@ function getErrorStatusCode(error: unknown): number | undefined {
   return undefined;
 }
 
+function isTimeoutError(error: unknown): boolean {
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    msg.includes('timed out') ||
+    msg.includes('timeout') ||
+    msg.includes('aborted') ||
+    msg.includes('504')
+  );
+}
+
 function isTransientError(error: unknown): boolean {
   const status = getErrorStatusCode(error);
   if (status === 429 || status === 502 || status === 503 || status === 504) {
     return true;
   }
+  if (isTimeoutError(error)) return true;
   const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
   return (
     msg.includes('429') ||
@@ -267,18 +284,46 @@ function isModelFallbackEligible(error: unknown): boolean {
   return msg.includes('not_found') || msg.includes('not found');
 }
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s.`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function withFastRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  perAttemptMs: number,
+  deadlineAt: number,
+  maxRetries = 0
+): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const attemptStart = Date.now();
+    const remaining = deadlineAt - attemptStart;
+    if (remaining <= 1000) {
+      throw lastError ?? new Error(`${label} timed out before completing.`);
+    }
+    const callTimeout = Math.min(perAttemptMs, remaining - 300);
     try {
-      return await fn();
+      return await withTimeout(fn(), callTimeout, label);
     } catch (error) {
       lastError = error;
-      if (!isTransientError(error) || attempt === maxRetries) {
+      const elapsed = Date.now() - attemptStart;
+      if (isTimeoutError(error) || elapsed > 1200 || !isTransientError(error) || attempt === maxRetries) {
         throw error;
       }
-      const jitterMs = Math.floor(Math.random() * 250);
-      const delayMs = 700 * Math.pow(2, attempt) + jitterMs;
+      const delayMs = Math.min(250, Math.max(0, deadlineAt - Date.now() - 2500));
+      if (delayMs <= 0) throw error;
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
@@ -286,23 +331,35 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
 }
 
 async function generateWithModelFallback(
-  executeForModel: (model: string) => Promise<GenerateContentResponse>
+  executeForModel: (model: string) => Promise<GenerateContentResponse>,
+  dayCount = 3
 ): Promise<GenerateContentResponse> {
-  const models = resolveModelChain();
+  const models = resolveModelChain(dayCount);
+  const deadlineAt = Date.now() + 18_000;
   let lastError: unknown;
 
   for (let i = 0; i < models.length; i++) {
     const model = models[i];
+    const hasNext = i < models.length - 1;
+    // Fail over fast (4.5s) from primary so fallback completes inside strict 10s serverless limits.
+    const perAttemptMs = hasNext ? 4_500 : Math.max(3_500, deadlineAt - Date.now() - 300);
+    const retries = hasNext ? 0 : 1;
+
     try {
-      return await withRetry(() => executeForModel(model), 2);
+      return await withFastRetry(
+        () => executeForModel(model),
+        `Gemini (${model})`,
+        perAttemptMs,
+        deadlineAt,
+        retries
+      );
     } catch (error) {
       lastError = error;
-      const hasNext = i < models.length - 1;
       if (!hasNext || !isModelFallbackEligible(error)) {
         throw error;
       }
       console.warn(
-        `Gemini model "${model}" unavailable after retries; falling back to "${models[i + 1]}".`
+        `Gemini model "${model}" unavailable/slow; falling back to "${models[i + 1]}".`
       );
     }
   }
@@ -345,7 +402,8 @@ STRICT ENGINEERING & HONESTY RULES:
    - Otherwise set realismStatus to "realistic", isRealistic to true, and set warningMessage to a brief confirmation note.
 4. Keep budget breakdown percentages summing to 100 and breakdown amounts summing to estimatedTotal.
 5. Generate exactly ${dates.length} day entries matching these exact dates: ${dates.join(', ')}.
-6. Every activity must make geographic sense for ${input.destination} so travellers aren't zig-zagging needlessly across the region.`;
+6. Every activity must make geographic sense for ${input.destination} so travellers aren't zig-zagging needlessly across the region.
+7. Keep prose crisp and practical (1-2 concise sentences per activity description, 2-3 recommended attractions per day, 2 food recommendations per day, 2 travel suggestions per day) for fast, scannable output.`;
 
   const prompt = `Plan a personalized trip with these parameters:
 - Starting Location: ${input.startLocation}
@@ -362,19 +420,21 @@ Context notes to incorporate into disclaimers:
 - ${lodgingAdvisory.advisory}
 - ${weatherAdvisory.advisory}`;
 
-  const response = await generateWithModelFallback((model) =>
-    ai.models.generateContent({
-      model,
-      contents: prompt,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: itinerarySchema,
-        ...(model === PRIMARY_GEMINI_MODEL
-          ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-          : {}),
-      },
-    })
+  const response = await generateWithModelFallback(
+    (model) =>
+      ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: itinerarySchema,
+          ...(model === PRIMARY_GEMINI_MODEL
+            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+            : {}),
+        },
+      }),
+    dates.length
   );
 
   const rawText = response.text?.trim();
@@ -426,19 +486,21 @@ ${conversationSnippet || '(New conversation)'}
 Latest Traveller Message:
 ${params.userMessage}`;
 
-  const response = await generateWithModelFallback((model) =>
-    ai.models.generateContent({
-      model,
-      contents: prompt,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: chatResponseSchema,
-        ...(model === PRIMARY_GEMINI_MODEL
-          ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-          : {}),
-      },
-    })
+  const response = await generateWithModelFallback(
+    (model) =>
+      ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          responseSchema: chatResponseSchema,
+          ...(model === PRIMARY_GEMINI_MODEL
+            ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+            : {}),
+        },
+      }),
+    params.currentItinerary.days?.length ?? 3
   );
 
   const rawText = response.text?.trim();

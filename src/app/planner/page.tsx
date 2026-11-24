@@ -1,11 +1,13 @@
 'use client';
 
-import { Suspense, useState } from 'react';
+import { Suspense, useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useAuthModal } from '@/src/components/ClientShell';
 import { ItineraryWorkspace } from '@/src/components/ItineraryWorkspace';
 import { TripPlannerForm } from '@/src/components/TripPlannerForm';
 import type { ItineraryData, SavedTrip, TripInput } from '@/src/types/travel';
+
+const PREVIEW_STORAGE_KEY = 'tripgenie_active_preview_v1';
 
 function PlannerPageContent() {
   const router = useRouter();
@@ -17,6 +19,33 @@ function PlannerPageContent() {
   const [itinerary, setItinerary] = useState<ItineraryData | null>(null);
   const [savedTrip, setSavedTrip] = useState<SavedTrip | null>(null);
 
+  useEffect(() => {
+    if (prefillDestination) return;
+    try {
+      const raw = sessionStorage.getItem(PREVIEW_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { input?: TripInput; itinerary?: ItineraryData };
+      if (parsed.input && parsed.itinerary) {
+        setTripInput(parsed.input);
+        setItinerary(parsed.itinerary);
+      }
+    } catch {
+      // Ignore corrupt sessionStorage state
+    }
+  }, [prefillDestination]);
+
+  function persistPreview(input: TripInput | null, data: ItineraryData | null) {
+    try {
+      if (input && data) {
+        sessionStorage.setItem(PREVIEW_STORAGE_KEY, JSON.stringify({ input, itinerary: data }));
+      } else {
+        sessionStorage.removeItem(PREVIEW_STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+
   if (tripInput && itinerary) {
     return (
       <ItineraryWorkspace
@@ -25,18 +54,21 @@ function PlannerPageContent() {
         savedTrip={savedTrip}
         onItineraryUpdated={(next) => {
           setItinerary(next);
+          persistPreview(tripInput, next);
           if (savedTrip) {
             setSavedTrip({ ...savedTrip, itinerary: next });
           }
         }}
         onTripSaved={(saved) => {
           setSavedTrip(saved);
+          persistPreview(null, null);
           router.replace(`/trips/${saved.id}`);
         }}
         onBack={() => {
           setTripInput(null);
           setItinerary(null);
           setSavedTrip(null);
+          persistPreview(null, null);
         }}
         onRequestAuth={() =>
           openAuthModal(
@@ -54,6 +86,7 @@ function PlannerPageContent() {
         setTripInput(input);
         setItinerary(generated);
         setSavedTrip(null);
+        persistPreview(input, generated);
         window.scrollTo({ top: 0, behavior: 'smooth' });
       }}
     />

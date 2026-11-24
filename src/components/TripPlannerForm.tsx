@@ -135,11 +135,14 @@ export function TripPlannerForm({
     };
 
     setIsGenerating(true);
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 25_000);
     try {
       const res = await fetch('/api/trips/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
       const rawText = await res.text();
       let data: {
@@ -151,6 +154,16 @@ export function TripPlannerForm({
         try {
           data = JSON.parse(rawText) as typeof data;
         } catch {
+          if (res.status === 504) {
+            throw new Error(
+              'Itinerary generation timed out on the server (504). Please try again—or select fewer days if planning a long trip.'
+            );
+          }
+          if (res.status === 502 || res.status === 503) {
+            throw new Error(
+              'The AI travel service is temporarily busy. Please try again in a few moments.'
+            );
+          }
           throw new Error(`Server returned an unexpected response (${res.status}).`);
         }
       }
@@ -162,10 +175,17 @@ export function TripPlannerForm({
 
       onItineraryGenerated(payload, data.itinerary);
     } catch (err) {
-      setSubmitError(
-        err instanceof Error ? err.message : 'Unable to generate itinerary right now.'
-      );
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setSubmitError(
+          'The request took longer than expected and timed out. Please try again.'
+        );
+      } else {
+        setSubmitError(
+          err instanceof Error ? err.message : 'Unable to generate itinerary right now.'
+        );
+      }
     } finally {
+      window.clearTimeout(timeoutId);
       setIsGenerating(false);
     }
   }

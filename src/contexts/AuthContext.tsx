@@ -50,12 +50,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       const result = await signInWithPopup(auth, googleProvider);
       return result.user;
     } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message.includes('popup-closed-by-user')
-            ? 'Sign-in window was closed before completing authentication.'
-            : error.message
-          : 'Unable to sign in with Google.';
+      let message = 'Unable to sign in with Google.';
+      if (error instanceof Error) {
+        if (error.message.includes('popup-closed-by-user')) {
+          message = 'Sign-in window was closed before completing authentication.';
+        } else if (error.message.includes('popup-blocked')) {
+          message = 'Your browser blocked the Google sign-in popup. Please allow popups and try again.';
+        } else if (error.message.includes('unauthorized-domain')) {
+          message =
+            'This domain is not yet added to Firebase Authorized Domains. Add it in Firebase Console > Authentication > Settings > Authorized domains. You can still plan itineraries freely without signing in.';
+        } else {
+          message = error.message;
+        }
+      }
       setAuthError(message);
       return null;
     } finally {

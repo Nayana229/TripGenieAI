@@ -168,6 +168,19 @@ export function extractApiError(error: unknown): { status: number; message: stri
   }
 
   if (
+    lower.includes('timed out') ||
+    lower.includes('timeout') ||
+    lower.includes('504') ||
+    statusCode === 504
+  ) {
+    return {
+      status: 504,
+      message:
+        'The AI planner took too long to respond due to heavy upstream load. Please try again—shorter trips generate fastest.',
+    };
+  }
+
+  if (
     lower.includes('fetch failed') ||
     lower.includes('econnrefused') ||
     lower.includes('enotfound') ||
