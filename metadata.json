@@ -1,0 +1,6 @@
+{
+  "name": "TripGenie AI",
+  "description": "Your Journey, Intelligently Planned. An intelligent full-stack travel planning platform with AI-generated day-wise itineraries, smart budget calibration, and conversational refinement.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

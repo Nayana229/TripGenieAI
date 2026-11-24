@@ -1,0 +1,201 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated traveller profile and default planning preferences.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "preferredCurrency": {
+          "type": "string",
+          "enum": ["USD", "EUR", "GBP", "JPY", "INR", "AUD", "CAD", "CHF"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "email", "preferredCurrency", "createdAt", "updatedAt"]
+    },
+    "Trip": {
+      "title": "Trip",
+      "description": "A personalized travel plan and AI-generated day-wise itinerary owned by a single user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 140
+        },
+        "startLocation": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "destination": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "startDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "maxLength": 10
+        },
+        "endDate": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "maxLength": 10
+        },
+        "travellers": {
+          "type": "integer"
+        },
+        "totalBudget": {
+          "type": "number"
+        },
+        "currency": {
+          "type": "string",
+          "enum": ["USD", "EUR", "GBP", "JPY", "INR", "AUD", "CAD", "CHF"]
+        },
+        "personality": {
+          "type": "string",
+          "enum": ["Adventure", "Nature", "Food", "Spiritual", "Luxury", "Budget"]
+        },
+        "accommodation": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "preferences": {
+          "type": "array"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["upcoming", "completed", "draft"]
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "itinerary": {
+          "type": "object"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "userId",
+        "title",
+        "startLocation",
+        "destination",
+        "startDate",
+        "endDate",
+        "travellers",
+        "totalBudget",
+        "currency",
+        "personality",
+        "accommodation",
+        "preferences",
+        "status",
+        "notes",
+        "itinerary",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TripMessage": {
+      "title": "TripMessage",
+      "description": "Conversational AI travel assistant message scoped to a specific saved trip.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "tripId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "assistant"]
+        },
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 6000
+        },
+        "appliedUpdate": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "tripId", "userId", "role", "content", "appliedUpdate", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user profile isolated strictly to the owning Firebase Auth UID."
+    },
+    "/trips/{tripId}": {
+      "schema": { "$ref": "#/entities/Trip" },
+      "description": "User-owned saved travel plans and AI-generated itineraries."
+    },
+    "/trips/{tripId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/TripMessage" },
+      "description": "Conversational itinerary assistant messages belonging to a parent trip."
+    }
+  }
+}
