@@ -4,6 +4,7 @@ import {
   SUPPORTED_CURRENCIES,
   TRAVEL_PERSONALITIES,
 } from '../types/travel';
+import { GeminiConfigError } from './geminiService';
 
 export const tripInputSchema = z
   .object({
@@ -73,24 +74,68 @@ export const chatRequestSchema = z.object({
 });
 
 export function extractApiError(error: unknown): { status: number; message: string } {
-  const msg = error instanceof Error ? error.message : 'Unexpected server error.';
-  if (
-    msg.includes('API_KEY_INVALID') ||
-    msg.includes('PERMISSION_DENIED') ||
-    msg.includes('not configured')
-  ) {
+  if (error instanceof GeminiConfigError) {
     return {
       status: 503,
       message:
-        'AI planning service requires a valid Gemini API key in Settings > Secrets before generating itineraries.',
+        'Gemini API key is not configured on the server. Add GEMINI_API_KEY in Settings > Secrets (or .env.local for local development) and try again.',
     };
   }
-  if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) {
+
+  const msg = error instanceof Error ? error.message : String(error || 'Unexpected server error.');
+  const statusCode =
+    typeof error === 'object' && error !== null && 'status' in error
+      ? Number((error as { status?: unknown }).status)
+      : undefined;
+
+  if (
+    msg.includes('API_KEY_INVALID') ||
+    msg.includes('API key not valid') ||
+    statusCode === 401
+  ) {
+    return {
+      status: 401,
+      message:
+        'The configured GEMINI_API_KEY is invalid. Please check or replace your key in Settings > Secrets.',
+    };
+  }
+
+  if (msg.includes('PERMISSION_DENIED') || statusCode === 403) {
+    return {
+      status: 403,
+      message:
+        'Gemini API permission denied for the configured key. Please verify your GEMINI_API_KEY in Settings > Secrets.',
+    };
+  }
+
+  if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429') || statusCode === 429) {
     return {
       status: 429,
-      message: 'AI planning rate limit reached. Please wait a moment and try again.',
+      message:
+        'Gemini API quota or rate limit reached. Please wait a moment and try again, or select a billing-enabled key in Settings > Secrets.',
     };
   }
+
+  if (msg.includes('NOT_FOUND') || statusCode === 404) {
+    return {
+      status: 502,
+      message: 'The requested Gemini model is unavailable for the configured API key.',
+    };
+  }
+
+  if (
+    msg.includes('fetch failed') ||
+    msg.includes('ECONNREFUSED') ||
+    msg.includes('ENOTFOUND') ||
+    msg.includes('ETIMEDOUT') ||
+    msg.includes('UND_ERR_CONNECT_TIMEOUT')
+  ) {
+    return {
+      status: 502,
+      message: 'Network error while reaching the Gemini API. Please check connectivity and retry.',
+    };
+  }
+
   return {
     status: 500,
     message: msg,

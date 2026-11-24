@@ -141,11 +141,19 @@ export function TripPlannerForm({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const data = (await res.json()) as {
+      const rawText = await res.text();
+      let data: {
         itinerary?: ItineraryData;
         error?: string;
         details?: Array<{ message: string }>;
-      };
+      } = {};
+      if (rawText) {
+        try {
+          data = JSON.parse(rawText) as typeof data;
+        } catch {
+          throw new Error(`Server returned an unexpected response (${res.status}).`);
+        }
+      }
 
       if (!res.ok || !data.itinerary) {
         const detailMsg = data.details?.[0]?.message;

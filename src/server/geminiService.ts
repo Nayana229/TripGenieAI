@@ -4,10 +4,33 @@ import { modularTravelAdapters } from './travelProviders';
 
 const MODEL_NAME = 'gemini-4-hydrogen';
 
+export class GeminiConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GeminiConfigError';
+  }
+}
+
+export function getGeminiApiKey(): string | null {
+  const candidates = [process.env.GEMINI_API_KEY, process.env.GOOGLE_API_KEY];
+  for (const raw of candidates) {
+    if (!raw) continue;
+    const cleaned = raw.trim().replace(/^["']|["']$/g, '').trim();
+    if (
+      cleaned &&
+      cleaned !== 'MY_GEMINI_API_KEY' &&
+      cleaned !== 'YOUR_GEMINI_API_KEY'
+    ) {
+      return cleaned;
+    }
+  }
+  return null;
+}
+
 function createGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
-    throw new Error('GEMINI_API_KEY is not configured on the server.');
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) {
+    throw new GeminiConfigError('GEMINI_API_KEY is not configured on the server.');
   }
   return new GoogleGenAI({
     apiKey,
@@ -17,6 +40,19 @@ function createGeminiClient(): GoogleGenAI {
       },
     },
   });
+}
+
+function parseJsonSafe<T>(rawText: string, label: string): T {
+  const stripped = rawText
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  try {
+    return JSON.parse(stripped) as T;
+  } catch {
+    throw new Error(`Received an invalid JSON structure while parsing ${label}.`);
+  }
 }
 
 const activitySlotSchema: Schema = {
@@ -186,7 +222,12 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
     } catch (error) {
       lastError = error;
       const msg = error instanceof Error ? error.message : String(error);
-      const isTransient = msg.includes('429') || msg.includes('503') || msg.includes('UNAVAILABLE');
+      const isTransient =
+        msg.includes('429') ||
+        msg.includes('503') ||
+        msg.includes('UNAVAILABLE') ||
+        msg.includes('ECONNRESET') ||
+        msg.includes('ETIMEDOUT');
       if (!isTransient || attempt === maxRetries) {
         throw error;
       }
@@ -265,7 +306,7 @@ Context notes to incorporate into disclaimers:
     throw new Error('Gemini returned an empty itinerary response.');
   }
 
-  const parsed = JSON.parse(rawText) as ItineraryData;
+  const parsed = parseJsonSafe<ItineraryData>(rawText, 'itinerary');
   // Ensure currency and userBudget match input deterministically
   parsed.budgetAnalysis.userBudget = input.totalBudget;
   parsed.budgetAnalysis.currency = input.currency;
@@ -326,11 +367,11 @@ ${params.userMessage}`;
     throw new Error('Gemini returned an empty chat response.');
   }
 
-  const parsed = JSON.parse(rawText) as {
+  const parsed = parseJsonSafe<{
     reply: string;
     shouldUpdateItinerary: boolean;
     updatedItinerary?: ItineraryData;
-  };
+  }>(rawText, 'chat response');
 
   if (parsed.shouldUpdateItinerary && parsed.updatedItinerary) {
     parsed.updatedItinerary.budgetAnalysis.userBudget = params.tripInput.totalBudget;

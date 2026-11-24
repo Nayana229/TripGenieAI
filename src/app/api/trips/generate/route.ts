@@ -2,6 +2,9 @@ import { NextResponse } from 'next/server';
 import { generateStructuredItinerary } from '@/src/server/geminiService';
 import { extractApiError, tripInputSchema } from '@/src/server/validation';
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
 export async function POST(req: Request) {
   let body: unknown;
   try {

@@ -70,12 +70,20 @@ export function ItineraryChatbot({
         }),
       });
 
-      const data = (await res.json()) as {
+      const rawText = await res.text();
+      let data: {
         reply?: string;
         shouldUpdateItinerary?: boolean;
         updatedItinerary?: ItineraryData;
         error?: string;
-      };
+      } = {};
+      if (rawText) {
+        try {
+          data = JSON.parse(rawText) as typeof data;
+        } catch {
+          throw new Error(`Server returned an unexpected response (${res.status}).`);
+        }
+      }
 
       if (!res.ok || !data.reply) {
         throw new Error(data.error || 'Unable to process your request.');
