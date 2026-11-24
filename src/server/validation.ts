@@ -73,62 +73,106 @@ export const chatRequestSchema = z.object({
     .max(BLUEPRINT_LIMITS.MESSAGE_MAX, 'Message is too long.'),
 });
 
+function extractReadableMessage(error: unknown): {
+  rawMessage: string;
+  friendlyMessage: string;
+  statusCode?: number;
+} {
+  const rawMessage =
+    error instanceof Error ? error.message : String(error || 'Unexpected server error.');
+  let statusCode =
+    typeof error === 'object' && error !== null && 'status' in error
+      ? Number((error as { status?: unknown }).status)
+      : undefined;
+
+  let friendlyMessage = rawMessage;
+  const trimmed = rawMessage.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        error?: { code?: number; message?: string; status?: string };
+        message?: string;
+      };
+      if (parsed.error?.code && !statusCode) {
+        statusCode = Number(parsed.error.code);
+      }
+      friendlyMessage = parsed.error?.message || parsed.message || 'Upstream AI service error.';
+    } catch {
+      friendlyMessage = 'An unexpected response was received from the AI service.';
+    }
+  }
+
+  return { rawMessage, friendlyMessage, statusCode };
+}
+
 export function extractApiError(error: unknown): { status: number; message: string } {
   if (error instanceof GeminiConfigError) {
     return {
       status: 503,
       message:
-        'Gemini API key is not configured on the server. Add GEMINI_API_KEY in Settings > Secrets (or .env.local for local development) and try again.',
+        'Gemini API key is not configured on the server. Add GEMINI_API_KEY in your environment variables (Settings > Secrets or Vercel Environment Variables) and try again.',
     };
   }
 
-  const msg = error instanceof Error ? error.message : String(error || 'Unexpected server error.');
-  const statusCode =
-    typeof error === 'object' && error !== null && 'status' in error
-      ? Number((error as { status?: unknown }).status)
-      : undefined;
+  const { rawMessage, friendlyMessage, statusCode } = extractReadableMessage(error);
+  const lower = `${rawMessage} ${friendlyMessage}`.toLowerCase();
 
   if (
-    msg.includes('API_KEY_INVALID') ||
-    msg.includes('API key not valid') ||
+    lower.includes('api_key_invalid') ||
+    lower.includes('api key not valid') ||
     statusCode === 401
   ) {
     return {
       status: 401,
       message:
-        'The configured GEMINI_API_KEY is invalid. Please check or replace your key in Settings > Secrets.',
+        'The configured GEMINI_API_KEY is invalid. Please check or replace your key in Settings > Secrets or Vercel Environment Variables.',
     };
   }
 
-  if (msg.includes('PERMISSION_DENIED') || statusCode === 403) {
+  if (lower.includes('permission_denied') || statusCode === 403) {
     return {
       status: 403,
       message:
-        'Gemini API permission denied for the configured key. Please verify your GEMINI_API_KEY in Settings > Secrets.',
-    };
-  }
-
-  if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429') || statusCode === 429) {
-    return {
-      status: 429,
-      message:
-        'Gemini API quota or rate limit reached. Please wait a moment and try again, or select a billing-enabled key in Settings > Secrets.',
-    };
-  }
-
-  if (msg.includes('NOT_FOUND') || statusCode === 404) {
-    return {
-      status: 502,
-      message: 'The requested Gemini model is unavailable for the configured API key.',
+        'Gemini API permission denied for the configured key. Please verify your GEMINI_API_KEY permissions.',
     };
   }
 
   if (
-    msg.includes('fetch failed') ||
-    msg.includes('ECONNREFUSED') ||
-    msg.includes('ENOTFOUND') ||
-    msg.includes('ETIMEDOUT') ||
-    msg.includes('UND_ERR_CONNECT_TIMEOUT')
+    lower.includes('503') ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand') ||
+    lower.includes('overloaded') ||
+    statusCode === 503
+  ) {
+    return {
+      status: 503,
+      message:
+        'Our AI travel planning models are temporarily experiencing high demand. We automatically retried with a fallback model, so please try again in a few moments.',
+    };
+  }
+
+  if (lower.includes('resource_exhausted') || lower.includes('429') || statusCode === 429) {
+    return {
+      status: 429,
+      message:
+        'Gemini API quota or rate limit reached. Please wait a moment and try again, or verify your billing quota.',
+    };
+  }
+
+  if (lower.includes('not_found') || statusCode === 404) {
+    return {
+      status: 502,
+      message:
+        'The requested Gemini model is unavailable for the configured API key. Please check your GEMINI_MODEL or API key access.',
+    };
+  }
+
+  if (
+    lower.includes('fetch failed') ||
+    lower.includes('econnrefused') ||
+    lower.includes('enotfound') ||
+    lower.includes('etimedout') ||
+    lower.includes('und_err_connect_timeout')
   ) {
     return {
       status: 502,
@@ -138,6 +182,8 @@ export function extractApiError(error: unknown): { status: number; message: stri
 
   return {
     status: 500,
-    message: msg,
+    message: friendlyMessage.startsWith('{')
+      ? 'Unable to generate your itinerary right now. Please try again.'
+      : friendlyMessage,
   };
 }

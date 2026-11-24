@@ -1,8 +1,25 @@
-import { GoogleGenAI, Type, type Schema } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type, type GenerateContentResponse, type Schema } from '@google/genai';
 import type { ItineraryData, TripInput } from '../types/travel';
 import { modularTravelAdapters } from './travelProviders';
 
-const MODEL_NAME = 'gemini-4-hydrogen';
+export const PRIMARY_GEMINI_MODEL = 'gemini-4-hydrogen';
+export const FALLBACK_GEMINI_MODELS = ['gemini-3.1-flash-lite'] as const;
+
+const DEPRECATED_MODELS = new Set([
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
+  'gemini-pro',
+  'gemini-2.0-flash',
+  'gemini-2.0-pro',
+  'gemini-2.0-flash-thinking',
+]);
+
+export function resolveModelChain(): string[] {
+  const envModel = process.env.GEMINI_MODEL?.trim();
+  const primary =
+    envModel && !DEPRECATED_MODELS.has(envModel) ? envModel : PRIMARY_GEMINI_MODEL;
+  return Array.from(new Set([primary, ...FALLBACK_GEMINI_MODELS]));
+}
 
 export class GeminiConfigError extends Error {
   constructor(message: string) {
@@ -214,6 +231,42 @@ const chatResponseSchema: Schema = {
   required: ['reply', 'shouldUpdateItinerary'],
 };
 
+function getErrorStatusCode(error: unknown): number | undefined {
+  if (typeof error === 'object' && error !== null && 'status' in error) {
+    const code = Number((error as { status?: unknown }).status);
+    if (!Number.isNaN(code)) return code;
+  }
+  return undefined;
+}
+
+function isTransientError(error: unknown): boolean {
+  const status = getErrorStatusCode(error);
+  if (status === 429 || status === 502 || status === 503 || status === 504) {
+    return true;
+  }
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    msg.includes('429') ||
+    msg.includes('503') ||
+    msg.includes('504') ||
+    msg.includes('unavailable') ||
+    msg.includes('high demand') ||
+    msg.includes('overloaded') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('econnreset') ||
+    msg.includes('etimedout') ||
+    msg.includes('fetch failed')
+  );
+}
+
+function isModelFallbackEligible(error: unknown): boolean {
+  if (isTransientError(error)) return true;
+  const status = getErrorStatusCode(error);
+  if (status === 404) return true;
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return msg.includes('not_found') || msg.includes('not found');
+}
+
 async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -221,19 +274,39 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
       return await fn();
     } catch (error) {
       lastError = error;
-      const msg = error instanceof Error ? error.message : String(error);
-      const isTransient =
-        msg.includes('429') ||
-        msg.includes('503') ||
-        msg.includes('UNAVAILABLE') ||
-        msg.includes('ECONNRESET') ||
-        msg.includes('ETIMEDOUT');
-      if (!isTransient || attempt === maxRetries) {
+      if (!isTransientError(error) || attempt === maxRetries) {
         throw error;
       }
-      await new Promise((resolve) => setTimeout(resolve, 600 * Math.pow(2, attempt)));
+      const jitterMs = Math.floor(Math.random() * 250);
+      const delayMs = 700 * Math.pow(2, attempt) + jitterMs;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
+  throw lastError;
+}
+
+async function generateWithModelFallback(
+  executeForModel: (model: string) => Promise<GenerateContentResponse>
+): Promise<GenerateContentResponse> {
+  const models = resolveModelChain();
+  let lastError: unknown;
+
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    try {
+      return await withRetry(() => executeForModel(model), 2);
+    } catch (error) {
+      lastError = error;
+      const hasNext = i < models.length - 1;
+      if (!hasNext || !isModelFallbackEligible(error)) {
+        throw error;
+      }
+      console.warn(
+        `Gemini model "${model}" unavailable after retries; falling back to "${models[i + 1]}".`
+      );
+    }
+  }
+
   throw lastError;
 }
 
@@ -289,14 +362,17 @@ Context notes to incorporate into disclaimers:
 - ${lodgingAdvisory.advisory}
 - ${weatherAdvisory.advisory}`;
 
-  const response = await withRetry(() =>
+  const response = await generateWithModelFallback((model) =>
     ai.models.generateContent({
-      model: MODEL_NAME,
+      model,
       contents: prompt,
       config: {
         systemInstruction,
         responseMimeType: 'application/json',
         responseSchema: itinerarySchema,
+        ...(model === PRIMARY_GEMINI_MODEL
+          ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+          : {}),
       },
     })
   );
@@ -350,14 +426,17 @@ ${conversationSnippet || '(New conversation)'}
 Latest Traveller Message:
 ${params.userMessage}`;
 
-  const response = await withRetry(() =>
+  const response = await generateWithModelFallback((model) =>
     ai.models.generateContent({
-      model: MODEL_NAME,
+      model,
       contents: prompt,
       config: {
         systemInstruction,
         responseMimeType: 'application/json',
         responseSchema: chatResponseSchema,
+        ...(model === PRIMARY_GEMINI_MODEL
+          ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+          : {}),
       },
     })
   );
