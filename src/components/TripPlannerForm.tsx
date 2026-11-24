@@ -136,7 +136,7 @@ export function TripPlannerForm({
 
     setIsGenerating(true);
     const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 25_000);
+    const timeoutId = window.setTimeout(() => controller.abort(), 30_000);
     try {
       const res = await fetch('/api/trips/generate', {
         method: 'POST',

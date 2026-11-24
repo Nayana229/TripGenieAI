@@ -226,10 +226,23 @@ export function extractApiError(error: unknown): { status: number; message: stri
       availableModelsCount: error.availableModels?.length ?? null,
     });
 
+    const grouped = new Map<string, { status?: number; count: number }>();
+    for (const a of error.attempts) {
+      const prev = grouped.get(a.model);
+      if (prev) {
+        prev.count += 1;
+        prev.status = a.status ?? prev.status;
+      } else {
+        grouped.set(a.model, { status: a.status, count: 1 });
+      }
+    }
+
     const base = classifySingleError(error.lastError);
-    if (error.attempts.length > 0) {
-      const attemptSummary = error.attempts
-        .map((a) => `${a.model} [${a.status ?? 'ERR'}]`)
+    if (grouped.size > 0) {
+      const attemptSummary = Array.from(grouped.entries())
+        .map(([model, info]) =>
+          `${model} [${info.status ?? 'ERR'}${info.count > 1 ? ` x${info.count}` : ''}]`
+        )
         .join(', ');
       return {
         status: base.status,

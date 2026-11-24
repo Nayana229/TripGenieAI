@@ -12,13 +12,14 @@ import { modularTravelAdapters } from './travelProviders';
 export const PRIMARY_GEMINI_MODEL = 'gemini-4-hydrogen';
 export const FALLBACK_GEMINI_MODELS = ['gemini-3.1-flash-lite'] as const;
 
-// Non-deprecated fast/lite generateContent candidates ordered by preference
-// when verifying or extending against ai.models.list().
-const PREFERRED_VERIFIED_MODELS = [
+// Active non-deprecated text models prioritized when confirmed available by ai.models.list().
+// Notice we do NOT hardcode deprecated 1.x/2.0 models or unverified models like gemini-2.5-flash;
+// any additional models come strictly from live ai.models.list() discovery.
+const PREFERRED_ACTIVE_MODELS = [
   'gemini-4-hydrogen',
   'gemini-3.1-flash-lite',
   'gemini-3-flash-preview',
-  'gemini-2.5-flash',
+  'gemini-3.1-flash',
   'gemini-2.5-flash-lite',
 ] as const;
 
@@ -36,7 +37,7 @@ const DEPRECATED_MODELS = new Set([
   'gemini-2.0-flash-exp',
 ]);
 
-// Paid-tier-only models that must not be auto-selected on free keys unless explicitly configured.
+// Paid-tier-only models from skill spec; excluded from automatic selection unless explicitly configured via GEMINI_MODEL.
 const PAID_ONLY_MODELS = new Set([
   'gemini-4-carbon',
   'gemini-4-neon',
@@ -54,18 +55,25 @@ const NON_TEXT_MODEL_RE =
   /(embed|imagen|veo|lyria|tts|transcribe|live|audio|image|genie|decision|robotics|computer-use|aqa|gemma|bisect|learnlm)/i;
 
 const MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
-const MAX_MODELS_PER_REQUEST = 3;
+const MODEL_404_TTL_MS = 15 * 60 * 1000;
+const MODEL_429_COOLDOWN_MS = 30 * 1000;
+const MAX_CANDIDATE_MODELS = 8;
 
 interface CachedModelsEntry {
   keyFingerprint: string;
   fetchedAt: number;
+  allModelsCount: number;
   generateContentModels: string[];
 }
 
 let cachedModels: CachedModelsEntry | null = null;
+// Tracks models that returned 404 (unsupported/not found) or 429 (rate-limited) per key fingerprint.
+const unavailableModelsCache = new Map<string, number>();
+const rateLimitedModelsCache = new Map<string, number>();
 
 export interface ModelAttemptRecord {
   model: string;
+  attempt: number;
   status?: number;
   code?: string;
   message: string;
@@ -130,7 +138,43 @@ function getKeyFingerprint(apiKey: string): string {
   return createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
 }
 
-function createGeminiClient(): { ai: GoogleGenAI; apiKey: string } {
+function cacheKeyForModel(fingerprint: string, model: string): string {
+  return `${fingerprint}:${model}`;
+}
+
+function isModelMarked404(fingerprint: string | undefined, model: string): boolean {
+  if (!fingerprint) return false;
+  const key = cacheKeyForModel(fingerprint, model);
+  const expiresAt = unavailableModelsCache.get(key);
+  if (!expiresAt) return false;
+  if (Date.now() > expiresAt) {
+    unavailableModelsCache.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markModel404(fingerprint: string, model: string): void {
+  unavailableModelsCache.set(cacheKeyForModel(fingerprint, model), Date.now() + MODEL_404_TTL_MS);
+}
+
+function isModelRateLimited(fingerprint: string | undefined, model: string): boolean {
+  if (!fingerprint) return false;
+  const key = cacheKeyForModel(fingerprint, model);
+  const expiresAt = rateLimitedModelsCache.get(key);
+  if (!expiresAt) return false;
+  if (Date.now() > expiresAt) {
+    rateLimitedModelsCache.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function markModelRateLimited(fingerprint: string, model: string, cooldownMs = MODEL_429_COOLDOWN_MS): void {
+  rateLimitedModelsCache.set(cacheKeyForModel(fingerprint, model), Date.now() + cooldownMs);
+}
+
+function createGeminiClient(): { ai: GoogleGenAI; apiKey: string; fingerprint: string } {
   const { apiKey } = getGeminiApiKeyDetails();
   if (!apiKey) {
     throw new GeminiConfigError('GEMINI_API_KEY is not configured on the server.');
@@ -143,7 +187,7 @@ function createGeminiClient(): { ai: GoogleGenAI; apiKey: string } {
       },
     },
   });
-  return { ai, apiKey };
+  return { ai, apiKey, fingerprint: getKeyFingerprint(apiKey) };
 }
 
 function normalizeModelId(rawName: string | undefined): string {
@@ -176,9 +220,29 @@ function isCandidateTextModel(modelId: string, allowExplicitEnvModel?: string): 
   return normalized.startsWith('gemini-');
 }
 
+function scoreDiscoveredModel(modelId: string): number {
+  const lower = modelId.toLowerCase();
+  let score = 0;
+  if (lower.startsWith('gemini-4')) score += 400;
+  else if (lower.startsWith('gemini-3.5')) score += 350;
+  else if (lower.startsWith('gemini-3.1')) score += 310;
+  else if (lower.startsWith('gemini-3')) score += 300;
+  else if (lower.startsWith('gemini-2.5')) score += 250;
+
+  if (lower.includes('hydrogen')) score += 60;
+  if (lower.includes('flash-lite') || lower.includes('lite')) score += 50;
+  else if (lower.includes('flash')) score += 45;
+  else if (lower.includes('pro')) score += 20;
+
+  if (lower.includes('latest')) score += 10;
+  if (lower.includes('preview') || lower.includes('exp')) score -= 5;
+  return score;
+}
+
 export function resolveModelChain(
   dayCount = 3,
-  availableGenerateContentModels?: string[]
+  availableGenerateContentModels?: string[],
+  keyFingerprint?: string
 ): string[] {
   const rawEnvModel = normalizeModelId(process.env.GEMINI_MODEL);
   const envModel = rawEnvModel && !isDeprecatedModelId(rawEnvModel) ? rawEnvModel : '';
@@ -188,56 +252,51 @@ export function resolveModelChain(
       ? ['gemini-3.1-flash-lite', PRIMARY_GEMINI_MODEL]
       : [PRIMARY_GEMINI_MODEL, ...FALLBACK_GEMINI_MODELS];
 
+  const filterHealthy = (list: string[]) => {
+    const not404 = list.filter((id) => !isModelMarked404(keyFingerprint, id));
+    const healthyFirst = not404.filter((id) => !isModelRateLimited(keyFingerprint, id));
+    const rateLimitedLater = not404.filter((id) => isModelRateLimited(keyFingerprint, id));
+    return [...healthyFirst, ...rateLimitedLater];
+  };
+
   if (!availableGenerateContentModels || availableGenerateContentModels.length === 0) {
-    return Array.from(new Set([...(envModel ? [envModel] : []), ...baseDefaults]))
-      .filter((id) => isCandidateTextModel(id, envModel))
-      .slice(0, MAX_MODELS_PER_REQUEST);
+    const fallbackList = Array.from(new Set([...(envModel ? [envModel] : []), ...baseDefaults]))
+      .filter((id) => isCandidateTextModel(id, envModel));
+    const healthy = filterHealthy(fallbackList);
+    return (healthy.length > 0 ? healthy : baseDefaults).slice(0, MAX_CANDIDATE_MODELS);
   }
 
-  const desiredOrder = Array.from(
+  const availableSet = new Set(availableGenerateContentModels.map((m) => normalizeModelId(m)));
+  const desiredPreferred = Array.from(
     new Set([
       ...(envModel ? [envModel] : []),
       ...baseDefaults,
-      ...PREFERRED_VERIFIED_MODELS,
+      ...PREFERRED_ACTIVE_MODELS,
     ])
-  ).filter((id) => isCandidateTextModel(id, envModel));
+  ).filter((id) => isCandidateTextModel(id, envModel) && availableSet.has(id));
 
-  const availableSet = new Set(availableGenerateContentModels.map((m) => normalizeModelId(m)));
-  const verifiedPreferred = desiredOrder.filter((id) => availableSet.has(id));
-
-  // Add any remaining verified non-deprecated Gemini flash/lite text models from models.list()
-  const extraVerified = availableGenerateContentModels
+  const extraDiscovered = availableGenerateContentModels
     .map((m) => normalizeModelId(m))
-    .filter(
-      (id) =>
-        !verifiedPreferred.includes(id) &&
-        isCandidateTextModel(id, envModel) &&
-        (id.includes('flash') || id.includes('hydrogen') || id.includes('lite'))
-    );
+    .filter((id) => !desiredPreferred.includes(id) && isCandidateTextModel(id, envModel))
+    .sort((a, b) => scoreDiscoveredModel(b) - scoreDiscoveredModel(a));
 
-  const combined = [...verifiedPreferred, ...extraVerified];
-
-  if (combined.length > 0) {
-    return combined.slice(0, MAX_MODELS_PER_REQUEST);
+  const combined = Array.from(new Set([...desiredPreferred, ...extraDiscovered]));
+  const healthy = filterHealthy(combined);
+  if (healthy.length > 0) {
+    return healthy.slice(0, MAX_CANDIDATE_MODELS);
   }
 
-  // Last-resort verified text models if none matched flash/hydrogen naming
-  const anyVerifiedGemini = availableGenerateContentModels
-    .map((m) => normalizeModelId(m))
-    .filter((id) => isCandidateTextModel(id, envModel));
-
-  if (anyVerifiedGemini.length > 0) {
-    return anyVerifiedGemini.slice(0, MAX_MODELS_PER_REQUEST);
-  }
-
-  return baseDefaults.slice(0, MAX_MODELS_PER_REQUEST);
+  return Array.from(new Set([...(envModel ? [envModel] : []), ...baseDefaults])).slice(
+    0,
+    MAX_CANDIDATE_MODELS
+  );
 }
 
 export async function listVerifiedGenerateContentModels(
   ai: GoogleGenAI,
   apiKey: string,
   options?: { bypassCache?: boolean; timeoutMs?: number }
-): Promise<string[]> {
+): Promise<{ models: string[]; allModelsCount: number }> {
   const fingerprint = getKeyFingerprint(apiKey);
   if (
     !options?.bypassCache &&
@@ -245,40 +304,55 @@ export async function listVerifiedGenerateContentModels(
     cachedModels.keyFingerprint === fingerprint &&
     Date.now() - cachedModels.fetchedAt < MODEL_CACHE_TTL_MS
   ) {
-    return cachedModels.generateContentModels;
+    return {
+      models: cachedModels.generateContentModels,
+      allModelsCount: cachedModels.allModelsCount,
+    };
   }
 
-  const timeoutMs = options?.timeoutMs ?? 2_800;
-  const fetchList = async (): Promise<string[]> => {
+  const timeoutMs = options?.timeoutMs ?? 3_000;
+  const fetchList = async (): Promise<{ models: string[]; allModelsCount: number }> => {
     const pager = await ai.models.list({ config: { pageSize: 100 } });
     const supported: string[] = [];
+    const fallbackIfNoActions: string[] = [];
+    let allModelsCount = 0;
+
     for await (const model of pager) {
+      allModelsCount++;
       const id = normalizeModelId(model.name);
-      if (!id) continue;
+      if (!id || isDeprecatedModelId(id)) continue;
+
       const actions = model.supportedActions;
-      const supportsGenerate =
-        Array.isArray(actions) &&
-        actions.some((a) => a === 'generateContent' || a === 'generateText');
-      if (supportsGenerate && !isDeprecatedModelId(id)) {
-        supported.push(id);
+      if (Array.isArray(actions)) {
+        if (actions.some((a) => a === 'generateContent' || a === 'generateText')) {
+          supported.push(id);
+        }
+      } else {
+        fallbackIfNoActions.push(id);
       }
     }
-    return Array.from(new Set(supported));
+
+    const models = Array.from(
+      new Set(supported.length > 0 ? supported : fallbackIfNoActions)
+    );
+    return { models, allModelsCount };
   };
 
-  const models = await withTimeout(fetchList(), timeoutMs, 'Gemini models.list');
+  const result = await withTimeout(fetchList(), timeoutMs, 'Gemini models.list');
   cachedModels = {
     keyFingerprint: fingerprint,
     fetchedAt: Date.now(),
-    generateContentModels: models,
+    allModelsCount: result.allModelsCount,
+    generateContentModels: result.models,
   };
-  return models;
+  return result;
 }
 
 export async function verifyGeminiSetup(): Promise<{
   geminiConfigured: boolean;
   keyEnvVar: string | null;
   keyStatus: 'valid' | 'missing' | 'invalid' | 'permission_denied' | 'quota_exceeded' | 'error';
+  allListedModelsCount?: number;
   availableGenerateContentModels: string[];
   selectedModelChain: string[];
   errorMessage?: string;
@@ -296,22 +370,24 @@ export async function verifyGeminiSetup(): Promise<{
     };
   }
 
+  const fingerprint = getKeyFingerprint(apiKey);
   const ai = new GoogleGenAI({
     apiKey,
     httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
   });
 
   try {
-    const available = await listVerifiedGenerateContentModels(ai, apiKey, {
+    const { models, allModelsCount } = await listVerifiedGenerateContentModels(ai, apiKey, {
       bypassCache: true,
       timeoutMs: 5_000,
     });
-    const selectedModelChain = resolveModelChain(3, available);
+    const selectedModelChain = resolveModelChain(3, models, fingerprint);
     return {
       geminiConfigured: true,
       keyEnvVar: envVarName,
       keyStatus: 'valid',
-      availableGenerateContentModels: available,
+      allListedModelsCount: allModelsCount,
+      availableGenerateContentModels: models,
       selectedModelChain,
     };
   } catch (err) {
@@ -328,7 +404,7 @@ export async function verifyGeminiSetup(): Promise<{
       keyEnvVar: envVarName,
       keyStatus,
       availableGenerateContentModels: [],
-      selectedModelChain: resolveModelChain(3),
+      selectedModelChain: resolveModelChain(3, undefined, fingerprint),
       errorMessage: parsed.message,
     };
   }
@@ -538,7 +614,7 @@ function inspectUpstreamError(error: unknown): {
         message = parsed.message;
       }
     } catch {
-      // Keep original message if not JSON
+      // Keep raw message
     }
   }
 
@@ -569,21 +645,41 @@ function isTimeoutError(error: unknown): boolean {
   );
 }
 
-function isTransientError(error: unknown): boolean {
+function is404ModelError(error: unknown): boolean {
   const info = inspectUpstreamError(error);
-  if (info.status === 429 || info.status === 502 || info.status === 503 || info.status === 504) {
-    return true;
-  }
-  if (isTimeoutError(error)) return true;
+  if (info.status === 404) return true;
   const lower = `${info.code ?? ''} ${info.message}`.toLowerCase();
   return (
-    lower.includes('429') ||
-    lower.includes('503') ||
-    lower.includes('504') ||
+    lower.includes('not_found') ||
+    lower.includes('is not found') ||
+    lower.includes('not supported for generatecontent')
+  );
+}
+
+function is429RateLimitError(error: unknown): boolean {
+  const info = inspectUpstreamError(error);
+  if (info.status === 429) return true;
+  const lower = `${info.code ?? ''} ${info.message}`.toLowerCase();
+  return lower.includes('resource_exhausted') || lower.includes('quota') || lower.includes('rate limit');
+}
+
+function is503UnavailableError(error: unknown): boolean {
+  const info = inspectUpstreamError(error);
+  if (info.status === 503) return true;
+  const lower = `${info.code ?? ''} ${info.message}`.toLowerCase();
+  return (
     lower.includes('unavailable') ||
     lower.includes('high demand') ||
     lower.includes('overloaded') ||
-    lower.includes('resource_exhausted') ||
+    lower.includes('503')
+  );
+}
+
+function isTransientNetworkError(error: unknown): boolean {
+  const info = inspectUpstreamError(error);
+  if (info.status === 502 || info.status === 504) return true;
+  const lower = `${info.code ?? ''} ${info.message}`.toLowerCase();
+  return (
     lower.includes('econnreset') ||
     lower.includes('etimedout') ||
     lower.includes('fetch failed')
@@ -592,16 +688,19 @@ function isTransientError(error: unknown): boolean {
 
 function isModelFallbackEligible(error: unknown): boolean {
   if (isAuthOrKeyError(error)) return false;
-  if (isTransientError(error)) return true;
+  if (
+    is404ModelError(error) ||
+    is429RateLimitError(error) ||
+    is503UnavailableError(error) ||
+    isTimeoutError(error) ||
+    isTransientNetworkError(error)
+  ) {
+    return true;
+  }
   const info = inspectUpstreamError(error);
-  if (info.status === 404 || info.status === 400) return true;
+  if (info.status === 400) return true;
   const lower = `${info.code ?? ''} ${info.message}`.toLowerCase();
-  return (
-    lower.includes('not_found') ||
-    lower.includes('not found') ||
-    lower.includes('not supported') ||
-    lower.includes('invalid_argument')
-  );
+  return lower.includes('invalid_argument') || lower.includes('not supported');
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -620,30 +719,34 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 }
 
 function buildThinkingConfig(model: string): { thinkingConfig?: { thinkingLevel: ThinkingLevel } } {
-  // Only Gemini 4 primary model gets explicit LOW thinking; gemini-3.1-flash-lite defaults to MINIMAL,
-  // and non-Gemini-3/4 models reject thinkingLevel with 400.
+  // Only pass ThinkingLevel.LOW to gemini-4-hydrogen; gemini-3.1-flash-lite defaults to MINIMAL,
+  // and non-Gemini-3/4 models reject thinkingConfig with 400.
   if (model === 'gemini-4-hydrogen') {
     return { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } };
   }
   return {};
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function generateWithModelFallback(
   executeForModel: (ai: GoogleGenAI, model: string) => Promise<GenerateContentResponse>,
   dayCount = 3
 ): Promise<GenerateContentResponse> {
-  const { ai, apiKey } = createGeminiClient();
+  const { ai, apiKey, fingerprint } = createGeminiClient();
 
   let availableModels: string[] | undefined;
   try {
-    availableModels = await listVerifiedGenerateContentModels(ai, apiKey);
+    const listed = await listVerifiedGenerateContentModels(ai, apiKey);
+    availableModels = listed.models;
     if (availableModels.length > 0) {
       console.info(
-        `[TripGenie][Gemini] Verified generateContent models (${availableModels.length}): ${availableModels.join(', ')}`
+        `[TripGenie][Gemini] Discovered ${availableModels.length} generateContent models (from ${listed.allModelsCount} total): ${availableModels.join(', ')}`
       );
     }
   } catch (listErr) {
-    // Fail fast if the API key itself is invalid or lacks permission.
     if (isAuthOrKeyError(listErr)) {
       const info = inspectUpstreamError(listErr);
       console.error('[TripGenie][Gemini] models.list auth failure:', info);
@@ -651,91 +754,149 @@ async function generateWithModelFallback(
     }
     const info = inspectUpstreamError(listErr);
     console.warn(
-      `[TripGenie][Gemini] models.list skipped (${info.message}); falling back to default model chain.`
+      `[TripGenie][Gemini] models.list warning (${info.message}); using default active model chain.`
     );
   }
 
-  const models = resolveModelChain(dayCount, availableModels);
-  const deadlineAt = Date.now() + 18_000;
+  const models = resolveModelChain(dayCount, availableModels, fingerprint);
+  const deadlineAt = Date.now() + 22_000;
   const attempts: ModelAttemptRecord[] = [];
+  const rateLimitedModelsToRetryLater: string[] = [];
   let lastError: unknown;
 
   for (let i = 0; i < models.length; i++) {
     const model = models[i];
     const hasNext = i < models.length - 1;
     const remaining = deadlineAt - Date.now();
-    if (remaining <= 1_200) {
+    if (remaining <= 1_500) {
       break;
     }
 
-    // Fail over cleanly (up to 5.5s on primary when fallback exists) so we don't stall on overloaded models.
-    const callTimeoutMs = hasNext
-      ? Math.min(5_500, remaining - 3_000)
-      : Math.max(3_500, remaining - 250);
+    // Retry up to 2 times with exponential backoff on 503 Unavailable (only if it fails fast, not timeout).
+    const max503Retries = 2;
+    for (let retryIdx = 0; retryIdx <= max503Retries; retryIdx++) {
+      const attemptRemaining = deadlineAt - Date.now();
+      if (attemptRemaining <= 1_200) break;
 
-    const start = Date.now();
-    try {
-      const response = await withTimeout(
-        executeForModel(ai, model),
-        callTimeoutMs,
-        `Gemini (${model})`
-      );
-      return response;
-    } catch (error) {
-      const durationMs = Date.now() - start;
-      const info = inspectUpstreamError(error);
-      attempts.push({
-        model,
-        status: info.status,
-        code: info.code,
-        message: info.message,
-        durationMs,
-      });
-      lastError = error;
+      const perCallMs = hasNext
+        ? Math.min(7_500, attemptRemaining - 2_000)
+        : Math.max(3_500, attemptRemaining - 250);
 
-      console.error(
-        `[TripGenie][Gemini] Model "${model}" failed in ${durationMs}ms (status=${info.status ?? 'unknown'}, code=${info.code ?? 'none'}): ${info.message}`
-      );
+      const start = Date.now();
+      try {
+        return await withTimeout(
+          executeForModel(ai, model),
+          perCallMs,
+          `Gemini (${model})`
+        );
+      } catch (error) {
+        const durationMs = Date.now() - start;
+        const info = inspectUpstreamError(error);
+        const status =
+          info.status ??
+          (is404ModelError(error)
+            ? 404
+            : is429RateLimitError(error)
+              ? 429
+              : is503UnavailableError(error)
+                ? 503
+                : isTimeoutError(error)
+                  ? 504
+                  : undefined);
 
-      // Auth/key errors cannot be solved by trying another model — fail immediately.
-      if (isAuthOrKeyError(error)) {
-        throw error;
-      }
+        attempts.push({
+          model,
+          attempt: retryIdx + 1,
+          status,
+          code: info.code,
+          message: info.message,
+          durationMs,
+        });
+        lastError = error;
 
-      // Single fast retry ONLY when there is just 1 model in the chain and it failed quickly with a transient error.
-      if (!hasNext && models.length === 1 && durationMs < 1_200 && isTransientError(error)) {
-        const retryRemaining = deadlineAt - Date.now();
-        if (retryRemaining > 3_000) {
-          await new Promise((r) => setTimeout(r, 350));
-          const retryStart = Date.now();
-          try {
-            return await withTimeout(
-              executeForModel(ai, model),
-              Math.max(2_500, deadlineAt - Date.now() - 250),
-              `Gemini (${model} retry)`
-            );
-          } catch (retryErr) {
-            const retryInfo = inspectUpstreamError(retryErr);
-            attempts.push({
-              model: `${model} (retry)`,
-              status: retryInfo.status,
-              code: retryInfo.code,
-              message: retryInfo.message,
-              durationMs: Date.now() - retryStart,
-            });
-            lastError = retryErr;
+        console.error(
+          `[TripGenie][Gemini] Model "${model}" (attempt ${retryIdx + 1}) failed in ${durationMs}ms (status=${status ?? 'unknown'}, code=${info.code ?? 'none'}): ${info.message}`
+        );
+
+        // Auth/key errors cannot be fixed by retrying or switching models.
+        if (isAuthOrKeyError(error)) {
+          throw error;
+        }
+
+        // 404: Cache as unavailable for this key and move immediately to next supported model.
+        if (status === 404 || is404ModelError(error)) {
+          markModel404(fingerprint, model);
+          break;
+        }
+
+        // 429: Put model in short cooldown and move immediately to another model with separate quota.
+        if (status === 429 || is429RateLimitError(error)) {
+          markModelRateLimited(fingerprint, model);
+          rateLimitedModelsToRetryLater.push(model);
+          break;
+        }
+
+        // 503: Retry this model with exponential backoff + jitter if failure was quick and budget remains.
+        if (
+          (status === 503 || is503UnavailableError(error)) &&
+          retryIdx < max503Retries &&
+          !isTimeoutError(error) &&
+          durationMs < 4_000
+        ) {
+          const baseDelay = 450 * Math.pow(2, retryIdx);
+          const jitter = Math.floor(Math.random() * 180);
+          const backoffMs = Math.min(baseDelay + jitter, Math.max(0, deadlineAt - Date.now() - 2_500));
+          if (backoffMs >= 200) {
+            await sleep(backoffMs);
+            continue;
           }
         }
-      }
 
-      if (!hasNext || !isModelFallbackEligible(error)) {
+        // Otherwise stop retrying this model; fall back if eligible.
+        if (!isModelFallbackEligible(error)) {
+          throw new GeminiAggregateError(
+            `${model}: ${status ?? 'ERR'} ${info.message}`,
+            attempts,
+            error,
+            availableModels
+          );
+        }
         break;
       }
     }
   }
 
+  // If every model returned 429 and time permits, perform one brief rate-limit backoff retry on the first rate-limited model.
+  if (
+    rateLimitedModelsToRetryLater.length > 0 &&
+    attempts.every((a) => a.status === 429) &&
+    deadlineAt - Date.now() > 4_000
+  ) {
+    const retryModel = rateLimitedModelsToRetryLater[0];
+    await sleep(1_200);
+    const start = Date.now();
+    try {
+      return await withTimeout(
+        executeForModel(ai, retryModel),
+        Math.max(3_000, deadlineAt - Date.now() - 250),
+        `Gemini (${retryModel} rate-limit retry)`
+      );
+    } catch (retryErr) {
+      const info = inspectUpstreamError(retryErr);
+      attempts.push({
+        model: retryModel,
+        attempt: 2,
+        status: info.status ?? 429,
+        code: info.code,
+        message: info.message,
+        durationMs: Date.now() - start,
+      });
+      lastError = retryErr;
+    }
+  }
+
   const summary = attempts
-    .map((a) => `${a.model}: ${a.status ?? 'ERR'} ${a.message}`)
+    .map((a) => `${a.model}#${a.attempt}: ${a.status ?? 'ERR'} ${a.message}`)
     .join(' | ');
   throw new GeminiAggregateError(
     summary || 'All verified Gemini models failed.',
